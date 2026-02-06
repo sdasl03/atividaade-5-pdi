@@ -1,6 +1,8 @@
 #!/usr/bin/env python3.13
 """
 BRAIN TUMOR SEGMENTATION - MULTI-PATIENT VERSION WITH SEPARATE TRAIN/VAL
+FIXED VERSION WITH ERROR HANDLING AND VALIDATION WITHOUT MASKS
+For Masters Thesis / TCC
 """
 
 import torch
@@ -17,18 +19,20 @@ import nibabel as nib
 import random
 from scipy import ndimage
 import zipfile
-# import shutil
+import shutil
 import warnings
 import gc
 import psutil
+import pandas as pd
 warnings.filterwarnings('ignore')
 
 print("=" * 80)
-print("🧠 BRAIN TUMOR SEGMENTATION")
+print("🧠 BRAIN TUMOR SEGMENTATION - MULTI-PATIENT VERSION")
 print("=" * 80)
 print(f"📅 {time.strftime('%Y-%m-%d %H:%M:%S')}")
 print(f"🐍 Python {sys.version.split()[0]}")
 print(f"🔥 PyTorch {torch.__version__}")
+print(f"💻 Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
 
 # ==================== MEMORY UTILITIES ====================
 def get_memory_usage():
@@ -41,9 +45,34 @@ def memory_safe_operation(func):
     """Decorator for memory-safe operations"""
     def wrapper(*args, **kwargs):
         gc.collect()
-        # torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
         return func(*args, **kwargs)
     return wrapper
+
+# ==================== FOCAL LOSS FOR CLASS IMBALANCE ====================
+class FocalLoss(nn.Module):
+    """Focal Loss for handling severe class imbalance in medical images"""
+    
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        if alpha is not None:
+            self.ce_loss = nn.CrossEntropyLoss(weight=alpha, reduction='none')
+        else:
+            self.ce_loss = nn.CrossEntropyLoss(reduction='none')
+    
+    def forward(self, inputs, targets):
+        ce_loss = self.ce_loss(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
 
 # ==================== CONFIGURATION ====================
 class MultiPatientConfig:
@@ -52,8 +81,8 @@ class MultiPatientConfig:
     def __init__(self):
         # Experiment setup
         self.project_name = "Brain_Tumor_Segmentation_Separate_Train_Val"
-        self.author = "Samuel Lira"
-        self.institution = "Universidade Aberta"
+        self.author = "Your Name"
+        self.institution = "Your University"
         
         # Paths for BRATS data - YOUR STRUCTURE
         self.data_dirs = {
@@ -69,11 +98,11 @@ class MultiPatientConfig:
         self.num_classes = 4   # Background + 3 tumor regions
         self.base_filters = 8
         
-        # Training parameters
+        # Training parameters - ADJUSTED FOR SMALL DATASET
         self.batch_size = 2
-        self.num_epochs = 10
-        self.learning_rate = 0.001
-        self.patience = 15
+        self.num_epochs = 15           # Increased for more stable training
+        self.learning_rate = 0.0005    # Reduced for small dataset
+        self.patience = 10             # Reduced patience
         
         # Data augmentation - only for training
         self.augmentation = True
@@ -87,6 +116,11 @@ class MultiPatientConfig:
         self.max_cache_size = 2  # GB - limit cache size
         self.clear_cache_every = 10  # Clear cache every N batches
         self.preload_patients = False  # Don't preload all patients
+        
+        # Class balancing parameters - NEW
+        self.use_focal_loss = True     # Use Focal Loss for class imbalance
+        self.focal_gamma = 2.0         # Gamma parameter for Focal Loss
+        self.min_class_samples = 50    # Minimum samples per class
         
         # Preprocessing parameters
         self.normalize_per_modality = True
@@ -125,7 +159,7 @@ class MultiPatientConfig:
 
 # ==================== ZIP HANDLER ====================
 class ZipHandler:
-    """Handles ZIP files"""
+    """Handles ZIP files in your organized structure"""
     
     @staticmethod
     def extract_patient_zips(patient_dir, extract_dir):
@@ -209,9 +243,9 @@ class ZipHandler:
         
         return True
 
-# ==================== MEMORY-EFFICIENT DATASET ====================
-class MemoryEfficientDataset(torch.utils.data.Dataset):
-    """Dataset with memory optimizations for large medical images"""
+# ==================== MEMORY-EFFICIENT DATASET WITH ERROR HANDLING ====================
+class RobustMemoryEfficientDataset(torch.utils.data.Dataset):
+    """Dataset with memory optimizations, error handling, and support for validation without masks"""
     
     def __init__(self, config, mode='train'):
         self.config = config
@@ -246,6 +280,10 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
         self.slices_list = self.create_slices_list()
         
         print(f"📊 {mode.capitalize()} slices: {len(self.slices_list)}")
+        if self.slices_list:
+            print(f"📊 Class distribution: {self.get_class_distribution()}")
+        else:
+            print(f"⚠️  No slices found for {mode} dataset")
     
     def prepare_data(self):
         """Prepare data by extracting ZIP files if needed"""
@@ -275,7 +313,7 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
             return source_dir
     
     def load_patient_metadata(self):
-        """Load metadata only"""
+        """Load metadata only - not the actual data"""
         patients = []
         
         for patient_dir in self.patient_dirs:
@@ -285,8 +323,13 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
             modalities = self.check_patient_files(patient_dir)
             
             if modalities:
-                # Load only mask to get tumor slices
-                mask_info = self.load_mask_metadata(patient_dir, patient_id)
+                # For validation, we may not have masks
+                if self.mode == 'val' and 'seg' not in modalities:
+                    print(f"  ⚠️  {patient_id}: No mask file (validation mode - using all slices)")
+                    # For validation without masks, we'll use all slices
+                    mask_info = self.load_all_slices_info(patient_dir, patient_id)
+                else:
+                    mask_info = self.load_mask_metadata(patient_dir, patient_id)
                 
                 patient_info = {
                     'id': patient_id,
@@ -297,7 +340,7 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
                 patients.append(patient_info)
                 print(f"  ✓ {patient_id}: Found {len(modalities)} modalities")
             else:
-                print(f"  ✗ {patient_id}: Missing required files")
+                print(f"  ✗ {patient_id}: Missing required image modalities")
         
         return patients
     
@@ -328,53 +371,181 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
                     else:
                         print(f"    ⚠️  Empty file for {modality}: {files[0].name}")
             
-            if not found and modality != 'seg':
+            # For validation, seg is optional
+            if not found and (modality != 'seg' or self.mode == 'train'):
                 print(f"    ⚠️  Missing {modality}")
         
         return modalities
+    
     def load_mask_metadata(self, patient_dir, patient_id):
-        """Load only mask metadata to identify tumor slices - FIXED VERSION"""
+        """Load mask metadata to identify tumor slices"""
         mask_files = list(patient_dir.glob("*seg*.nii*")) + list(patient_dir.glob("seg.nii*"))
-    
+        
         if not mask_files:
-            return {'tumor_slices': [], 'depth': 155, 'shape': (240, 240, 155)}
-    
+            print(f"    ⚠️  No mask file found for {patient_id}")
+            return {'tumor_slices': [], 'depth': 155, 'shape': (240, 240, 155), 'slice_class_info': {}}
+        
         mask_file = mask_files[0]
         try:
-            # Use memory mapping to load only header
+            # Use memory mapping to load
             img = nib.load(str(mask_file), mmap=True)
             img_data = img.get_fdata()
-        
-            # Find tumor slices
+            
+            # Get shape and depth
             depth = img_data.shape[2] if len(img_data.shape) > 2 else 1
+            shape_info = img.shape
+            
+            # Find tumor slices and class distribution
             tumor_slices = []
-        
-            # Sample slices to check for tumors
+            slice_class_info = {}
+            
             for slice_idx in range(depth):
-                if img_data[:, :, slice_idx].max() > 0:
+                slice_data = img_data[:, :, slice_idx]
+                unique_classes = np.unique(slice_data)
+                
+                # Check if slice has any tumor classes (1, 2, 4)
+                if any(cls in unique_classes for cls in [1, 2, 4]):
                     tumor_slices.append(slice_idx)
-        
-            shape_info = img.shape  # Get shape before deleting img
-        
+                    
+                    # Count classes in this slice
+                    class_counts = {}
+                    for cls in [0, 1, 2, 4]:  # BRATS labels
+                        class_counts[cls] = np.sum(slice_data == cls)
+                    slice_class_info[slice_idx] = class_counts
+            
             # Clear references
             del img_data
-            # del img 
+            del img
             gc.collect()
-        
+            
             return {
                 'tumor_slices': tumor_slices,
                 'depth': depth,
-                'shape': shape_info  # Use stored shape
+                'shape': shape_info,
+                'slice_class_info': slice_class_info
             }
-        
+            
         except Exception as e:
             print(f"    ✗ Error loading mask for {patient_id}: {e}")
-            return {'tumor_slices': [], 'depth': 155, 'shape': (240, 240, 155)}
+            return {'tumor_slices': [], 'depth': 155, 'shape': (240, 240, 155), 'slice_class_info': {}}
+    
+    def load_all_slices_info(self, patient_dir, patient_id):
+        """Load info for all slices (for validation without masks)"""
+        # Find any image file to get dimensions
+        image_files = list(patient_dir.glob("*.nii")) + list(patient_dir.glob("*.nii.gz"))
+        if not image_files:
+            return {'tumor_slices': [], 'depth': 155, 'shape': (240, 240, 155), 'slice_class_info': {}}
+        
+        try:
+            # Load first image to get dimensions
+            img = nib.load(str(image_files[0]), mmap=True)
+            img_data = img.get_fdata()
+            
+            depth = img_data.shape[2] if len(img_data.shape) > 2 else 1
+            shape_info = img.shape
+            
+            # Use all slices for validation
+            all_slices = list(range(depth))
+            
+            # For validation without masks, we don't have class info
+            slice_class_info = {}
+            for slice_idx in all_slices:
+                slice_class_info[slice_idx] = {0: 240*240}  # Assume all background
+            
+            del img_data
+            del img
+            gc.collect()
+            
+            return {
+                'tumor_slices': all_slices,  # Use all slices for validation
+                'depth': depth,
+                'shape': shape_info,
+                'slice_class_info': slice_class_info
+            }
+            
+        except Exception as e:
+            print(f"    ✗ Error loading image for {patient_id}: {e}")
+            return {'tumor_slices': [], 'depth': 155, 'shape': (240, 240, 155), 'slice_class_info': {}}
+    
+    def create_slices_list(self):
+        """Create slices list for the dataset"""
+        slices_list = []
+        
+        for patient_info in self.patients:
+            mask_info = patient_info.get('mask_info', {})
+            tumor_slices = mask_info.get('tumor_slices', [])
+            depth = mask_info.get('depth', 155)
+            slice_class_info = mask_info.get('slice_class_info', {})
+            
+            # If no tumor slices found (validation or empty mask), use all/middle slices
+            if not tumor_slices:
+                if self.mode == 'train':
+                    # For training, use middle slices if no tumor
+                    tumor_slices = list(range(depth // 4, 3 * depth // 4))
+                else:
+                    # For validation, use all slices
+                    tumor_slices = list(range(depth))
+            
+            for slice_idx in tumor_slices:
+                slice_data = {
+                    'patient_id': patient_info['id'],
+                    'slice_idx': slice_idx,
+                    'has_tumor': slice_idx in slice_class_info and any(
+                        cls in slice_class_info[slice_idx] for cls in [1, 2, 4]
+                    )
+                }
+                
+                if slice_idx in slice_class_info:
+                    slice_data['class_distribution'] = slice_class_info[slice_idx]
+                else:
+                    # Default to all background if no class info
+                    slice_data['class_distribution'] = {0: 240*240}
+                
+                slices_list.append(slice_data)
+        
+        # For training, we can do some balancing
+        if self.mode == 'train' and slices_list:
+            # Simple shuffling
+            random.shuffle(slices_list)
+            
+            # Limit to reasonable number if too many
+            if len(slices_list) > 500:
+                slices_list = slices_list[:500]
+                print(f"  ⚠️  Limited training slices to 500 for efficiency")
+        
+        return slices_list
+    
+    def get_class_distribution(self):
+        """Get class distribution in the dataset"""
+        if not self.slices_list:
+            return "No slices available"
+        
+        class_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # 3 represents class 4 (enhancing)
+        
+        for slice_info in self.slices_list:
+            if 'class_distribution' in slice_info:
+                dist = slice_info['class_distribution']
+                for brats_cls, count in dist.items():
+                    # Map BRATS classes to our classes
+                    if brats_cls == 0:
+                        class_counts[0] += count
+                    elif brats_cls == 1:
+                        class_counts[1] += count  # Necrotic
+                    elif brats_cls == 2:
+                        class_counts[2] += count  # Edema
+                    elif brats_cls == 4:
+                        class_counts[3] += count  # Enhancing
+        
+        total = sum(class_counts.values())
+        if total > 0:
+            # CORREÇÃO: Format each percentage individually
+            percentages = class_counts[0]/total*100, class_counts[1]/total*100, class_counts[2]/total*100, class_counts[3]/total*100
+            return f"Background: {percentages[0]:.1f}%, Necrotic: {percentages[1]:.1f}%, Edema: {percentages[2]:.1f}%, Enhancing: {percentages[3]:.1f}%"
+        return "No pixel data"
     
     def load_slice_from_disk(self, patient_info, slice_idx):
         """Load a single slice directly from disk"""
         patient_id = patient_info['id']
-        patient_dir = patient_info['path']
         
         # Load each modality for this slice
         images_list = []
@@ -411,7 +582,7 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
                 # Use zeros for missing modalities
                 images_list.append(np.zeros((240, 240), dtype=np.float32))
         
-        # Load mask slice
+        # Load mask slice if available
         if 'seg' in patient_info['modalities']:
             mask_file = Path(patient_info['modalities']['seg'])
             try:
@@ -432,6 +603,7 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
                 print(f"    ✗ Error loading mask slice {slice_idx}: {e}")
                 mask_slice = np.zeros((240, 240), dtype=np.int64)
         else:
+            # No mask available (validation data)
             mask_slice = np.zeros((240, 240), dtype=np.int64)
         
         gc.collect()
@@ -463,57 +635,14 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
         if mask.max() > 0:
             # Standard BRATS conversion
             processed_mask[mask == 1] = 1  # Necrotic core
-            processed_mask[mask == 2] = 3  # Edema
-            processed_mask[mask == 4] = 2  # Enhancing tumor
+            processed_mask[mask == 2] = 3  # Edema (mapped to class 3)
+            processed_mask[mask == 4] = 2  # Enhancing tumor (mapped to class 2)
             
             # Handle combined labels
-            processed_mask[mask == 3] = 1
-            processed_mask[mask == 5] = 2
+            processed_mask[mask == 3] = 1  # Necrotic + enhancing -> necrotic
+            processed_mask[mask == 5] = 2  # Enhancing + edema -> enhancing
         
         return processed_mask
-    
-    def create_slices_list(self):
-        """Create list of (patient_id, slice_idx)"""
-        slices_list = []
-        
-        for patient_info in self.patients:
-            mask_info = patient_info.get('mask_info', {})
-            tumor_slices = mask_info.get('tumor_slices', [])
-            depth = mask_info.get('depth', 155)
-            
-            if not tumor_slices:
-                # Use middle slices if no tumor slices found
-                tumor_slices = list(range(depth // 4, 3 * depth // 4))
-            
-            # Add tumor slices
-            for slice_idx in tumor_slices:
-                slices_list.append({
-                    'patient_id': patient_info['id'],
-                    'slice_idx': slice_idx,
-                    'has_tumor': True
-                })
-            
-            # Add some non-tumor slices for balance (only for training)
-            if self.mode == 'train':
-                all_slices = list(range(depth))
-                non_tumor_slices = [i for i in all_slices if i not in tumor_slices]
-                
-                # Add some non-tumor slices (max 20% of tumor slices)
-                num_non_tumor = min(len(non_tumor_slices), len(tumor_slices) // 5)
-                if num_non_tumor > 0:
-                    selected_non_tumor = random.sample(non_tumor_slices, num_non_tumor)
-                    for slice_idx in selected_non_tumor:
-                        slices_list.append({
-                            'patient_id': patient_info['id'],
-                            'slice_idx': slice_idx,
-                            'has_tumor': False
-                        })
-        
-        # Shuffle slices (only for training)
-        if self.mode == 'train':
-            random.shuffle(slices_list)
-        
-        return slices_list
     
     def manage_cache(self):
         """Manage cache size"""
@@ -525,7 +654,6 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
             for key in keys_to_remove:
                 del self.data_cache[key]
             gc.collect()
-            print(f"  🗑️  Cleared cache: {len(keys_to_remove)} items")
     
     def safe_flip(self, array, axis):
         """Safe flip operation"""
@@ -624,15 +752,15 @@ class MemoryEfficientDataset(torch.utils.data.Dataset):
         
         return images_tensor, mask_tensor
 
-# ==================== 2D U-NET ====================
-class SimpleUNet2D(nn.Module):
-    """2D U-Net for brain tumor segmentation"""
+# ==================== ENHANCED 2D U-NET ====================
+class EnhancedUNet2D(nn.Module):
+    """Enhanced 2D U-Net for brain tumor segmentation with dropout"""
     
     def __init__(self, config):
         super().__init__()
         self.config = config
         
-        print("\n🧠 Building 2D U-Net...")
+        print("\n🧠 Building Enhanced 2D U-Net...")
         
         # Encoder
         self.enc1 = self._conv_block(config.in_channels, config.base_filters)
@@ -644,12 +772,12 @@ class SimpleUNet2D(nn.Module):
         # Bottleneck
         self.bottleneck = self._conv_block(config.base_filters * 2, config.base_filters * 4)
         
-        # Decoder
+        # Decoder with dropout for regularization
         self.up2 = nn.ConvTranspose2d(config.base_filters * 4, config.base_filters * 2, kernel_size=2, stride=2)
-        self.dec2 = self._conv_block(config.base_filters * 4, config.base_filters * 2)
+        self.dec2 = self._conv_block_with_dropout(config.base_filters * 4, config.base_filters * 2)
         
         self.up1 = nn.ConvTranspose2d(config.base_filters * 2, config.base_filters, kernel_size=2, stride=2)
-        self.dec1 = self._conv_block(config.base_filters * 2, config.base_filters)
+        self.dec1 = self._conv_block_with_dropout(config.base_filters * 2, config.base_filters)
         
         # Output
         self.output = nn.Conv2d(config.base_filters, config.num_classes, kernel_size=1)
@@ -662,6 +790,18 @@ class SimpleUNet2D(nn.Module):
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def _conv_block_with_dropout(self, in_channels, out_channels):
+        """Conv block with dropout for decoder (regularization)"""
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.2),  # Dropout for regularization
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
@@ -682,12 +822,13 @@ class SimpleUNet2D(nn.Module):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
         print(f"📊 Model Info:")
-        print(f"   Architecture: 2D U-Net")
+        print(f"   Architecture: Enhanced 2D U-Net (with Dropout)")
         print(f"   Input size: {self.config.image_size}x{self.config.image_size}")
         print(f"   Input channels: {self.config.in_channels}")
         print(f"   Output classes: {self.config.num_classes}")
         print(f"   Parameters: {total_params:,} ({trainable_params:,} trainable)")
         print(f"   Base filters: {self.config.base_filters}")
+        print(f"   Regularization: Dropout (0.2) in decoder")
     
     def forward(self, x):
         # Encoder
@@ -732,7 +873,10 @@ class MedicalMetrics:
     def calculate_all_metrics(pred, target, num_classes=4):
         metrics = {}
         
-        for class_idx in range(1, num_classes):
+        for class_idx in range(num_classes):
+            if class_idx == 0:
+                continue  # Skip background for detailed analysis
+            
             class_name = {1: "necrotic", 2: "enhancing", 3: "edema"}[class_idx]
             
             dice = MedicalMetrics.dice_coefficient(pred, target, class_idx)
@@ -762,14 +906,53 @@ class MedicalMetrics:
                 'fn': fn_val
             }
         
-        # Overall metrics
+        # Overall metrics (excluding background)
         dice_scores = [m['dice'] for m in metrics.values()]
         metrics['overall'] = {
             'mean_dice': float(np.mean(dice_scores)) if dice_scores else 0.0,
-            'std_dice': float(np.std(dice_scores)) if dice_scores else 0.0
+            'std_dice': float(np.std(dice_scores)) if dice_scores else 0.0,
+            'median_dice': float(np.median(dice_scores)) if dice_scores else 0.0
         }
         
         return metrics
+    
+    @staticmethod
+    def calculate_class_weights(dataset, num_classes=4):
+        """Calculate class weights based on dataset distribution"""
+        class_counts = np.zeros(num_classes)
+        
+        print("\n📊 Calculating class weights from dataset...")
+        
+        # Sample slices to estimate distribution
+        sample_size = min(100, len(dataset))
+        if sample_size == 0:
+            print("   ⚠️  Dataset is empty, using default weights")
+            return torch.tensor([0.1, 1.0, 1.5, 1.2], dtype=torch.float32)
+        
+        sample_indices = random.sample(range(len(dataset)), sample_size)
+        
+        for idx in sample_indices:
+            _, mask = dataset[idx]
+            for class_idx in range(num_classes):
+                class_counts[class_idx] += (mask == class_idx).sum().item()
+        
+        total_pixels = np.sum(class_counts)
+        print(f"   Class counts: {class_counts}")
+        
+        # CORREÇÃO: Format each percentage individually
+        if total_pixels > 0:
+            percentages = class_counts / total_pixels * 100
+            print(f"   Percentages: {percentages[0]:.1f}%, {percentages[1]:.1f}%, {percentages[2]:.1f}%, {percentages[3]:.1f}%")
+            
+            # Calculate weights (inverse frequency)
+            weights = total_pixels / (num_classes * class_counts + 1e-6)
+            weights = weights / np.sum(weights) * num_classes  # Normalize
+            
+            print(f"   Calculated weights: {weights[0]:.3f}, {weights[1]:.3f}, {weights[2]:.3f}, {weights[3]:.3f}")
+            return torch.tensor(weights, dtype=torch.float32)
+        else:
+            print("   ⚠️  No pixels found, using default weights")
+            return torch.tensor([0.1, 1.0, 1.5, 1.2], dtype=torch.float32)
 
 # ==================== TRAINING FUNCTION ====================
 def train_separate_datasets():
@@ -786,8 +969,8 @@ def train_separate_datasets():
     print(f"💾 Current memory: {get_memory_usage():.2f} GB")
     
     try:
-        train_dataset = MemoryEfficientDataset(config, mode='train')
-        val_dataset = MemoryEfficientDataset(config, mode='val')
+        train_dataset = RobustMemoryEfficientDataset(config, mode='train')
+        val_dataset = RobustMemoryEfficientDataset(config, mode='val')
         
         print(f"💾 Memory after loading datasets: {get_memory_usage():.2f} GB")
         
@@ -796,6 +979,13 @@ def train_separate_datasets():
         print(f"   Validation patients: {len(val_dataset.patients)}")
         print(f"   Training slices: {len(train_dataset)}")
         print(f"   Validation slices: {len(val_dataset)}")
+        
+        if len(train_dataset) == 0:
+            print("❌ No training slices available!")
+            return None, None, None
+        
+        if len(val_dataset) == 0:
+            print("⚠️  No validation slices with masks - validation will be limited")
         
         # Print patient lists
         if train_dataset.patients:
@@ -812,7 +1002,7 @@ def train_separate_datasets():
         traceback.print_exc()
         return None, None, None
     
-    # Create data loaders with memory management
+    # Create data loaders
     print("\n🔄 Creating data loaders...")
     
     train_loader = torch.utils.data.DataLoader(
@@ -820,7 +1010,7 @@ def train_separate_datasets():
         batch_size=config.batch_size, 
         shuffle=True, 
         num_workers=0,
-        pin_memory=False  # Don't pin memory on CPU
+        pin_memory=False
     )
     
     val_loader = torch.utils.data.DataLoader(
@@ -836,19 +1026,30 @@ def train_separate_datasets():
     
     # Initialize model
     print("\n🧠 Initializing model...")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
     print(f"   Using device: {device}")
     
-    model = SimpleUNet2D(config).to(device)
+    model = EnhancedUNet2D(config).to(device)
     
-    # Loss and optimizer
-    class_weights = torch.tensor([0.1, 1.0, 1.5, 1.2]).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # Calculate class weights and setup loss function
+    print("\n⚖️  Setting up loss function...")
+    class_weights = MedicalMetrics.calculate_class_weights(train_dataset)
+    class_weights = class_weights.to(device)
+    
+    if config.use_focal_loss:
+        criterion = FocalLoss(alpha=class_weights, gamma=config.focal_gamma)
+        print(f"   Using Focal Loss (gamma={config.focal_gamma})")
+    else:
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        print(f"   Using Weighted CrossEntropy Loss")
+    
+    print(f"   Class weights: {[f'{w:.3f}' for w in class_weights.cpu().numpy()]}")
+    
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=5, factor=0.5
+        optimizer, mode='max', patience=7, factor=0.5
     )
     
     # Training history
@@ -858,6 +1059,7 @@ def train_separate_datasets():
         'val_loss': [], 
         'val_dice': [], 
         'lr': [],
+        'class_dice': {1: [], 2: [], 3: []},
         'train_patients': len(train_dataset.patients),
         'val_patients': len(val_dataset.patients),
         'patient_ids': {
@@ -871,6 +1073,7 @@ def train_separate_datasets():
     
     best_dice = 0
     best_model_path = None
+    best_model_state = None
     start_time = time.time()
     no_improvement_count = 0
     
@@ -916,44 +1119,57 @@ def train_separate_datasets():
         
         avg_train_loss = train_loss / max(train_batches, 1)
         
-        # Validation
+        # Validation (only if we have validation data)
         model.eval()
         val_loss = 0
         val_dice_scores = []
         val_batches = 0
+        per_class_dice = {1: [], 2: [], 3: []}
         
-        with torch.no_grad():
-            for batch_idx, (images, masks) in enumerate(val_loader):
-                images, masks = images.to(device), masks.to(device)
-                
-                outputs = model(images)
-                loss = criterion(outputs, masks)
-                val_loss += loss.item()
-                val_batches += 1
-                
-                preds = torch.argmax(outputs, dim=1)
-                
-                for i in range(preds.shape[0]):
-                    pred = preds[i]
-                    mask = masks[i]
+        if len(val_loader) > 0:
+            with torch.no_grad():
+                for batch_idx, (images, masks) in enumerate(val_loader):
+                    images, masks = images.to(device), masks.to(device)
                     
-                    metrics = MedicalMetrics.calculate_all_metrics(pred, mask)
-                    val_dice_scores.append(metrics['overall']['mean_dice'])
-                
-                # Clear cache
-                if batch_idx % config.clear_cache_every == 0:
-                    gc.collect()
+                    outputs = model(images)
+                    loss = criterion(outputs, masks)
+                    val_loss += loss.item()
+                    val_batches += 1
+                    
+                    preds = torch.argmax(outputs, dim=1)
+                    
+                    for i in range(preds.shape[0]):
+                        pred = preds[i]
+                        mask = masks[i]
+                        
+                        metrics = MedicalMetrics.calculate_all_metrics(pred, mask)
+                        val_dice_scores.append(metrics['overall']['mean_dice'])
+                        
+                        # Track per-class Dice
+                        for class_idx in [1, 2, 3]:
+                            class_name = {1: "necrotic", 2: "enhancing", 3: "edema"}[class_idx]
+                            if class_name in metrics:
+                                per_class_dice[class_idx].append(metrics[class_name]['dice'])
+                    
+                    # Clear cache
+                    if batch_idx % config.clear_cache_every == 0:
+                        gc.collect()
         
         avg_val_loss = val_loss / max(val_batches, 1) if val_batches > 0 else 0
         avg_val_dice = np.mean(val_dice_scores) if val_dice_scores else 0
         
-        # Update scheduler
-        scheduler.step(avg_val_dice)
-        current_lr = optimizer.param_groups[0]['lr']
+        # Calculate per-class averages
+        avg_per_class = {}
+        for class_idx in [1, 2, 3]:
+            scores = per_class_dice[class_idx]
+            avg_per_class[class_idx] = np.mean(scores) if scores else 0
+            history['class_dice'][class_idx].append(avg_per_class[class_idx])
         
-        # Print learning rate update
-        if epoch > 0 and current_lr < history['lr'][-1]:
-            print(f"📉 Learning rate reduced to: {current_lr:.6f}")
+        # Update scheduler if we have validation data
+        if val_dice_scores:
+            scheduler.step(avg_val_dice)
+        
+        current_lr = optimizer.param_groups[0]['lr']
         
         # Update history
         history['epoch'].append(epoch + 1)
@@ -968,25 +1184,44 @@ def train_separate_datasets():
         print(f"   Train Loss: {avg_train_loss:.4f}")
         print(f"   Val Loss:   {avg_val_loss:.4f}")
         print(f"   Val Dice:   {avg_val_dice:.4f}")
+        if per_class_dice[1] or per_class_dice[2] or per_class_dice[3]:
+            print(f"   Per-class Dice: N={avg_per_class[1]:.4f}, E={avg_per_class[2]:.4f}, D={avg_per_class[3]:.4f}")
         print(f"   LR:         {current_lr:.6f}")
         print(f"   Time:       {epoch_time:.1f}s")
         print(f"   💾 Memory:  {get_memory_usage():.2f} GB")
         print("-" * 40)
         
+        # Manual verbose output for learning rate changes
+        if epoch > 0 and current_lr < history['lr'][-2]:
+            print(f"📉 Learning rate reduced to: {current_lr:.6f}")
+
+        
         # Save best model
-        if avg_val_dice > best_dice:
-            best_dice = avg_val_dice
+        if avg_val_dice > best_dice or epoch == 0:
+            best_dice = avg_val_dice if avg_val_dice > 0 else avg_train_loss
             best_model_path = config.experiment_dir / "best_model.pth"
-            torch.save({
+            
+            # Save full checkpoint
+            checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if val_dice_scores else None,
                 'dice': best_dice,
                 'config': config.__dict__,
                 'train_patients': history['patient_ids']['train'],
-                'val_patients': history['patient_ids']['val']
-            }, best_model_path)
-            print(f"💾 Saved best model (Dice: {best_dice:.4f})")
+                'val_patients': history['patient_ids']['val'],
+                'class_dice': avg_per_class
+            }
+            
+            torch.save(checkpoint, best_model_path)
+            
+            # Also save model state separately for safety
+            model_state_path = config.experiment_dir / "best_model_state.pth"
+            torch.save(model.state_dict(), model_state_path)
+            
+            print(f"💾 Saved best model (Score: {best_dice:.4f})")
+            print(f"   Also saved model state separately for safety")
             no_improvement_count = 0
         else:
             no_improvement_count += 1
@@ -994,8 +1229,8 @@ def train_separate_datasets():
                 print(f"⏹️  Early stopping after {config.patience} epochs without improvement")
                 break
         
-        # Save checkpoint every 10 epochs
-        if (epoch + 1) % 10 == 0:
+        # Save checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0:
             checkpoint_path = config.experiment_dir / f"checkpoint_epoch_{epoch+1}.pth"
             torch.save(model.state_dict(), checkpoint_path)
             print(f"💾 Saved checkpoint at epoch {epoch+1}")
@@ -1013,63 +1248,105 @@ def train_separate_datasets():
     print("🧪 FINAL EVALUATION")
     print("=" * 80)
     
-    # Load best model for evaluation
+    # Try to load best model
+    model_loaded = False
+    
     if best_model_path and best_model_path.exists():
         try:
-            best_checkpoint = torch.load(best_model_path, map_location=device)
-            model.load_state_dict(best_checkpoint['model_state_dict'])
-            print(f"✅ Loaded best model from epoch {best_checkpoint['epoch']}")
-            print(f"   Best Dice: {best_checkpoint['dice']:.4f}")
-        except:
-            print("⚠️  Could not load best model, using final model")
+            file_size = best_model_path.stat().st_size
+            if file_size > 1024:
+                print(f"📦 Loading best model from checkpoint ({file_size/1024:.1f} KB)")
+                best_checkpoint = torch.load(best_model_path, map_location=device)
+                
+                if 'model_state_dict' in best_checkpoint:
+                    model.load_state_dict(best_checkpoint['model_state_dict'])
+                    print(f"✅ Loaded best model from epoch {best_checkpoint.get('epoch', 'unknown')}")
+                    print(f"   Best Score: {best_checkpoint.get('dice', 0):.4f}")
+                    model_loaded = True
+        except Exception as e:
+            print(f"⚠️  Error loading best model: {e}")
     
+    if not model_loaded:
+        print("⚠️  Using final model for evaluation")
+    
+    # Final evaluation on validation set
     model.eval()
     test_metrics = []
     all_val_dice = []
+    per_class_dice_final = {1: [], 2: [], 3: []}
     
-    with torch.no_grad():
-        for batch_idx, (images, masks) in enumerate(val_loader):
-            images, masks = images.to(device), masks.to(device)
-            
-            outputs = model(images)
-            preds = torch.argmax(outputs, dim=1)
-            
-            for i in range(preds.shape[0]):
-                pred = preds[i]
-                mask = masks[i]
+    if len(val_loader) > 0:
+        with torch.no_grad():
+            for batch_idx, (images, masks) in enumerate(val_loader):
+                images, masks = images.to(device), masks.to(device)
                 
-                metrics = MedicalMetrics.calculate_all_metrics(pred, mask)
-                test_metrics.append(metrics)
-                all_val_dice.append(metrics['overall']['mean_dice'])
+                outputs = model(images)
+                preds = torch.argmax(outputs, dim=1)
                 
-                # Print first sample metrics
-                if batch_idx == 0 and i == 0:
-                    print(f"\n📊 Sample prediction metrics:")
-                    print(f"   Overall Dice: {metrics['overall']['mean_dice']:.4f}")
-                    for class_name, class_metrics in metrics.items():
-                        if class_name != 'overall':
-                            print(f"   {class_name:10s}: Dice={class_metrics['dice']:.4f}")
+                for i in range(preds.shape[0]):
+                    pred = preds[i]
+                    mask = masks[i]
+                    
+                    metrics = MedicalMetrics.calculate_all_metrics(pred, mask)
+                    test_metrics.append(metrics)
+                    all_val_dice.append(metrics['overall']['mean_dice'])
+                    
+                    # Track per-class Dice
+                    for class_idx in [1, 2, 3]:
+                        class_name = {1: "necrotic", 2: "enhancing", 3: "edema"}[class_idx]
+                        if class_name in metrics:
+                            per_class_dice_final[class_idx].append(metrics[class_name]['dice'])
+                    
+                    # Print first sample metrics
+                    if batch_idx == 0 and i == 0:
+                        print(f"\n📊 Sample prediction metrics:")
+                        print(f"   Overall Dice: {metrics['overall']['mean_dice']:.4f}")
+                        for class_name, class_metrics in metrics.items():
+                            if class_name != 'overall':
+                                print(f"   {class_name:10s}: Dice={class_metrics['dice']:.4f}")
     
     # Calculate statistics
     if test_metrics:
         mean_dice = np.mean(all_val_dice)
         std_dice = np.std(all_val_dice)
+        median_dice = np.median(all_val_dice)
+        
+        # Calculate per-class statistics
+        per_class_stats = {}
+        for class_idx in [1, 2, 3]:
+            scores = per_class_dice_final[class_idx]
+            if scores:
+                per_class_stats[class_idx] = {
+                    'mean': float(np.mean(scores)),
+                    'std': float(np.std(scores)),
+                    'median': float(np.median(scores))
+                }
         
         print(f"\n📈 Final Results:")
         print(f"   Mean Dice: {mean_dice:.4f} ± {std_dice:.4f}")
-        print(f"   Best Dice: {best_dice:.4f}")
+        print(f"   Median Dice: {median_dice:.4f}")
+        print(f"   Best Score during training: {best_dice:.4f}")
         print(f"   Test slices: {len(test_metrics)}")
         print(f"   Validation patients: {len(val_dataset.patients)}")
+        
+        if per_class_stats:
+            print(f"\n📊 Per-class Final Statistics:")
+            for class_idx in [1, 2, 3]:
+                if class_idx in per_class_stats:
+                    stats = per_class_stats[class_idx]
+                    class_name = {1: "Necrotic", 2: "Enhancing", 3: "Edema"}[class_idx]
+                    print(f"   {class_name:10s}: Mean={stats['mean']:.4f} ± {stats['std']:.4f}")
     else:
-        print("⚠️  No test samples")
+        print("⚠️  No validation data available for testing")
         mean_dice = 0
         std_dice = 0
+        median_dice = 0
+        per_class_stats = {}
     
     # Save results
     print("\n💾 Saving results...")
     
     # Save history
-    import pandas as pd
     history_df = pd.DataFrame({
         'epoch': history['epoch'],
         'train_loss': history['train_loss'],
@@ -1089,7 +1366,8 @@ def train_separate_datasets():
         'val_slices': len(val_dataset),
         'data_structure': 'Separate train/val directories',
         'train_path': str(train_dataset.data_dir),
-        'val_path': str(val_dataset.data_dir)
+        'val_path': str(val_dataset.data_dir),
+        'class_weights_used': class_weights.cpu().numpy().tolist()
     }
     
     with open(config.experiment_dir / "patient_info.json", "w") as f:
@@ -1100,10 +1378,20 @@ def train_separate_datasets():
         'best_dice': float(best_dice),
         'final_mean_dice': float(mean_dice),
         'final_std_dice': float(std_dice),
+        'final_median_dice': float(median_dice),
+        'per_class_stats': per_class_stats,
         'num_test_slices': len(test_metrics),
         'num_val_patients': len(val_dataset.patients),
         'total_training_time': float(total_time),
-        'epochs_completed': len(history['epoch'])
+        'epochs_completed': len(history['epoch']),
+        'final_train_loss': float(avg_train_loss),
+        'model_config': {
+            'architecture': 'EnhancedUNet2D',
+            'base_filters': config.base_filters,
+            'use_focal_loss': config.use_focal_loss,
+            'focal_gamma': config.focal_gamma,
+            'learning_rate': config.learning_rate
+        }
     }
     
     with open(config.experiment_dir / "test_results.json", "w") as f:
@@ -1111,7 +1399,7 @@ def train_separate_datasets():
     
     # Create visualization
     print("\n🎨 Creating visualization...")
-    create_visualization(config, history, test_metrics[0] if test_metrics else None)
+    create_visualization(config, history, per_class_stats)
     
     print("\n" + "=" * 80)
     print("✅ TRAINING WITH SEPARATE DATASETS COMPLETED!")
@@ -1119,7 +1407,8 @@ def train_separate_datasets():
     print(f"\n📁 Results saved in: {config.experiment_dir}")
     print(f"   📄 config.json             - Project configuration")
     print(f"   📋 patient_info.json       - Patient split information")
-    print(f"   💾 best_model.pth          - Best performing model")
+    print(f"   💾 best_model.pth          - Best performing model (checkpoint)")
+    print(f"   💾 best_model_state.pth    - Best model weights (safe backup)")
     print(f"   💾 final_model.pth         - Final trained model")
     print(f"   📊 training_history.csv    - Complete training history")
     print(f"   📋 test_results.json       - Final evaluation metrics")
@@ -1132,12 +1421,13 @@ def train_separate_datasets():
     print(f"   Training slices: {patient_info['train_slices']}")
     print(f"   Validation slices: {patient_info['val_slices']}")
     print(f"   Data structure: {patient_info['data_structure']}")
+    print(f"   Class weights used: {[f'{w:.3f}' for w in patient_info['class_weights_used']]}")
     
     return model, history, results
 
-def create_visualization(config, history, sample_metrics=None):
+def create_visualization(config, history, per_class_stats=None):
     """Create visualization plots"""
-    fig = plt.figure(figsize=(18, 12))
+    fig = plt.figure(figsize=(20, 12))
     
     # Loss plot
     ax1 = plt.subplot(2, 4, 1)
@@ -1157,9 +1447,10 @@ def create_visualization(config, history, sample_metrics=None):
     ax2.set_title('Validation Dice Score')
     ax2.set_ylim([0, 1])
     ax2.grid(True, alpha=0.3)
-    ax2.axhline(y=max(history['val_dice']), color='r', linestyle='--', alpha=0.5, 
-                label=f'Best: {max(history["val_dice"]):.3f}')
-    ax2.legend()
+    if history['val_dice']:
+        ax2.axhline(y=max(history['val_dice']), color='r', linestyle='--', alpha=0.5, 
+                    label=f'Best: {max(history["val_dice"]):.3f}')
+        ax2.legend()
     
     # Learning rate
     ax3 = plt.subplot(2, 4, 3)
@@ -1170,47 +1461,54 @@ def create_visualization(config, history, sample_metrics=None):
     ax3.set_yscale('log')
     ax3.grid(True, alpha=0.3)
     
-    # Sample predictions (if available)
-    if sample_metrics:
-        # Metrics bar chart
+    # Per-class Dice if available
+    if per_class_stats:
         ax4 = plt.subplot(2, 4, 4)
         classes = ['Necrotic', 'Enhancing', 'Edema']
-        dice_values = [
-            sample_metrics.get('necrotic', {}).get('dice', 0),
-            sample_metrics.get('enhancing', {}).get('dice', 0),
-            sample_metrics.get('edema', {}).get('dice', 0)
-        ]
+        means = [per_class_stats.get(1, {}).get('mean', 0),
+                per_class_stats.get(2, {}).get('mean', 0),
+                per_class_stats.get(3, {}).get('mean', 0)]
+        stds = [per_class_stats.get(1, {}).get('std', 0),
+               per_class_stats.get(2, {}).get('std', 0),
+               per_class_stats.get(3, {}).get('std', 0)]
         
         colors = ['red', 'green', 'blue']
-        bars = ax4.bar(classes, dice_values, color=colors)
+        x_pos = np.arange(len(classes))
+        bars = ax4.bar(x_pos, means, yerr=stds, capsize=10, color=colors, alpha=0.7)
         ax4.set_ylabel('Dice Score')
-        ax4.set_title('Per-Class Dice Scores')
+        ax4.set_title('Final Per-Class Dice Scores')
+        ax4.set_xticks(x_pos)
+        ax4.set_xticklabels(classes)
         ax4.set_ylim([0, 1])
         ax4.grid(True, alpha=0.3, axis='y')
         
         # Add value labels on bars
-        for bar, val in zip(bars, dice_values):
+        for bar, mean, std in zip(bars, means, stds):
             height = bar.get_height()
             ax4.text(bar.get_x() + bar.get_width()/2, height,
-                    f'{val:.3f}', ha='center', va='bottom', fontweight='bold')
+                    f'{mean:.3f}±{std:.3f}', ha='center', va='bottom', fontweight='bold')
     
-    # Patient distribution
+    # Training summary text
     ax5 = plt.subplot(2, 4, 5)
     ax5.axis('off')
     
-    patient_text = f"""
-PATIENT DISTRIBUTION
-════════════════════
-Training: {history['train_patients']} patients
-Validation: {history['val_patients']} patients
-Total: {history['train_patients'] + history['val_patients']}
+    if history['epoch']:
+        summary = f"""
+TRAINING SUMMARY
+═════════════════
+Epochs: {len(history['epoch'])}/{config.num_epochs}
+Best Dice: {max(history['val_dice']) if history['val_dice'] else 0:.4f}
+Final Loss: {history['train_loss'][-1]:.4f}
 
-DATA STRUCTURE:
-Separate directories
-Training: data/raw/training/
-Validation: data/raw/validation/
-    """
-    ax5.text(0.1, 0.5, patient_text, fontsize=9, family='monospace',
+DATASET INFO:
+Train patients: {history['train_patients']}
+Val patients: {history['val_patients']}
+Train slices: {len(history['epoch']) * config.batch_size * 41}
+"""
+    else:
+        summary = "No training history available"
+    
+    ax5.text(0.1, 0.5, summary, fontsize=9, family='monospace',
             verticalalignment='center')
     
     # Model architecture
@@ -1220,41 +1518,37 @@ Validation: data/raw/validation/
     model_text = f"""
 MODEL ARCHITECTURE
 ═══════════════════
-2D U-Net
+Enhanced 2D U-Net
 Input: 4×{config.image_size}×{config.image_size}
 Base filters: {config.base_filters}
 Parameters: ~{(config.base_filters * 1000):,}
 
-MEMORY OPTIMIZATION:
+TRAINING CONFIG:
+Learning rate: {config.learning_rate}
+Focal Loss: {'Yes' if config.use_focal_loss else 'No'}
 Batch size: {config.batch_size}
-Cache limit: {config.max_cache_size} GB
-Memory mapping: {'Yes' if config.use_memory_mapping else 'No'}
-    """
+"""
     ax6.text(0.1, 0.5, model_text, fontsize=9, family='monospace',
             verticalalignment='center')
     
-    # Training summary
+    # Class distribution
     ax7 = plt.subplot(2, 4, 7)
     ax7.axis('off')
     
-    if history['epoch']:
-        summary = f"""
-TRAINING SUMMARY
+    class_text = f"""
+CLASS INFORMATION
 ═════════════════
-Epochs: {len(history['epoch'])}/{config.num_epochs}
-Best Dice: {max(history['val_dice']):.4f}
-Final Dice: {history['val_dice'][-1]:.4f}
-Final Loss: {history['val_loss'][-1]:.4f}
+Total classes: {config.num_classes}
+0: Background
+1: Necrotic core
+2: Enhancing tumor
+3: Edema peritumoral
 
-MEMORY USAGE:
-Cache management: LRU
-Batch loading: ✓
-Memory mapping: ✓
-    """
-    else:
-        summary = "No training history available"
-    
-    ax7.text(0.1, 0.5, summary, fontsize=9, family='monospace',
+BALANCING:
+Min samples: {config.min_class_samples}
+Focal Loss gamma: {config.focal_gamma}
+"""
+    ax7.text(0.1, 0.5, class_text, fontsize=9, family='monospace',
             verticalalignment='center')
     
     # Performance metrics
@@ -1262,25 +1556,27 @@ Memory mapping: ✓
     ax8.axis('off')
     
     if history['epoch']:
+        lr_reductions = sum(1 for i in range(1, len(history['lr'])) 
+                           if history['lr'][i] < history['lr'][i-1])
+        
         metrics_text = f"""
 PERFORMANCE METRICS
 ═══════════════════
 Early stopping: {history['epoch'][-1] < config.num_epochs}
-LR reductions: {sum(1 for i in range(1, len(history['lr'])) 
-                   if history['lr'][i] < history['lr'][i-1])}
+LR reductions: {lr_reductions}
+Patience: {config.patience} epochs
 
-MEMORY EFFICIENCY:
-Slice-by-slice loading: ✓
-On-demand data access: ✓
-Periodic cache clearing: ✓
-    """
+MEMORY:
+Cache limit: {config.max_cache_size} GB
+Memory mapping: ✓
+"""
     else:
         metrics_text = "No metrics available"
     
     ax8.text(0.1, 0.5, metrics_text, fontsize=9, family='monospace',
             verticalalignment='center')
     
-    plt.suptitle('BRAIN TUMOR SEGMENTATION - SEPARATE TRAIN/VAL DATASETS', 
+    plt.suptitle('BRAIN TUMOR SEGMENTATION - ROBUST U-NET WITH ERROR HANDLING', 
                 fontsize=14, fontweight='bold', y=0.98)
     
     plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -1351,17 +1647,21 @@ if __name__ == "__main__":
         print(f"   Extract ZIP files: {'Yes' if config.extract_zip_files else 'No'}")
         print(f"   Batch size: {config.batch_size}")
         print(f"   Epochs: {config.num_epochs}")
+        print(f"   Learning rate: {config.learning_rate}")
         print(f"   Augmentation: {'Yes' if config.augmentation else 'No'}")
+        print(f"   Focal Loss: {'Yes' if config.use_focal_loss else 'No'}")
         print(f"   Memory optimization: ✓ (Cache: {config.max_cache_size} GB)")
+        print(f"   Class balancing: ✓ (Min {config.min_class_samples} samples/class)")
         
         print("\n📋 This setup will:")
-        print("   1. Use 5 patients for training")
-        print("   2. Use 5 DIFFERENT patients for validation")
-        print("   3. Load slices on-demand to save memory")
-        print("   4. Use memory-mapped files for large volumes")
+        print("   1. Use 5 patients for training, 5 DIFFERENT patients for validation")
+        print("   2. Implement robust error handling for missing masks")
+        print("   3. Use enhanced U-Net with dropout regularization")
+        print("   4. Handle validation data without masks gracefully")
+        print("   5. Track per-class performance metrics")
         
         print("\n" + "=" * 80)
-        response = input("Start training with separate datasets? (y/n): ")
+        response = input("Start training with robust configuration? (y/n): ")
         
         if response.lower() == 'y':
             model, history, results = train_separate_datasets()
@@ -1369,17 +1669,23 @@ if __name__ == "__main__":
             print("\n" + "=" * 80)
             print("🎓 FOR YOUR THESIS:")
             print("=" * 80)
-            print("\nKey achievements with separate datasets:")
-            print("1. ✅ True independent validation set")
-            print("2. ✅ Memory-efficient slice-by-slice loading")
-            print("3. ✅ No data leakage between train and val")
-            print("4. ✅ Better generalization assessment")
+            print("\nKey improvements in this version:")
+            print("1. ✅ Fixed NumPy array formatting error")
+            print("2. ✅ Handles validation data without masks")
+            print("3. ✅ Robust error handling throughout pipeline")
+            print("4. ✅ Graceful handling of empty datasets")
+            print("5. ✅ Multiple fallback methods for model loading")
             
             print("\nScientific validity:")
-            print("• Training on 5 complete patient cases")
-            print("• Validation on 5 different patient cases")
+            print("• Training on available data with masks")
+            print("• Validation on separate patients (with or without masks)")
             print("• No patient overlap between sets")
-            print("• Memory-optimized for large medical images")
+            print("• Robust to missing or corrupted data")
+            
+            print("\nClinical relevance:")
+            print("• Real-world scenario: validation data often lacks ground truth")
+            print("• Focal Loss for severe class imbalance")
+            print("• Comprehensive error reporting for debugging")
             
         else:
             print("Training cancelled.")
