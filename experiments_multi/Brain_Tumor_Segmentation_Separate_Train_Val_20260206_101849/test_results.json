@@ -1,0 +1,9 @@
+{
+  "best_dice": 0.5222222222222223,
+  "final_mean_dice": 0.29487179487179493,
+  "final_std_dice": 0.21734456233621377,
+  "num_test_slices": 390,
+  "num_val_patients": 5,
+  "total_training_time": 1607.8283834457397,
+  "epochs_completed": 10
+}

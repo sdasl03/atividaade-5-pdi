@@ -1,0 +1,23 @@
+{
+  "train_patients": [
+    "BraTS001",
+    "BraTS002",
+    "BraTS003",
+    "BraTS004",
+    "BraTS005"
+  ],
+  "val_patients": [
+    "BraTS001",
+    "BraTS002",
+    "BraTS003",
+    "BraTS004",
+    "BraTS005"
+  ],
+  "total_train_patients": 5,
+  "total_val_patients": 5,
+  "train_slices": 369,
+  "val_slices": 390,
+  "data_structure": "Separate train/val directories",
+  "train_path": "data\\extracted\\train",
+  "val_path": "data\\extracted\\val"
+}
