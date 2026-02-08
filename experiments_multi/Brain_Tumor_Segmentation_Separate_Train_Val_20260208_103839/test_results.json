@@ -1,0 +1,35 @@
+{
+  "best_dice": 0.12523121772185164,
+  "final_mean_dice": 0.0868411527516441,
+  "final_std_dice": 0.09270045185018258,
+  "final_median_dice": 0.04637682189544042,
+  "per_class_stats": {
+    "1": {
+      "mean": 0.05288338002032888,
+      "std": 0.0903365318399692,
+      "median": 0.0
+    },
+    "2": {
+      "mean": 0.13533835440516512,
+      "std": 0.17828536304990364,
+      "median": 0.014347744174301624
+    },
+    "3": {
+      "mean": 0.0723017238294383,
+      "std": 0.04802859425930486,
+      "median": 0.07003989815711975
+    }
+  },
+  "num_test_slices": 321,
+  "num_val_patients": 5,
+  "total_training_time": 5025.550114154816,
+  "epochs_completed": 12,
+  "final_train_loss": 0.001970640846505581,
+  "model_config": {
+    "architecture": "EnhancedUNet2D",
+    "base_filters": 16,
+    "use_focal_loss": true,
+    "focal_gamma": 2.0,
+    "learning_rate": 0.0005
+  }
+}

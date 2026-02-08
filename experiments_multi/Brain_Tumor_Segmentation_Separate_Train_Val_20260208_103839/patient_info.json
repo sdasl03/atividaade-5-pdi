@@ -1,0 +1,29 @@
+{
+  "train_patients": [
+    "BraTS001",
+    "BraTS002",
+    "BraTS003",
+    "BraTS004",
+    "BraTS005"
+  ],
+  "val_patients": [
+    "BraTS006",
+    "BraTS007",
+    "BraTS008",
+    "BraTS009",
+    "BraTS010"
+  ],
+  "total_train_patients": 5,
+  "total_val_patients": 5,
+  "train_slices": 309,
+  "val_slices": 321,
+  "data_structure": "Separate train/val directories",
+  "train_path": "data\\extracted\\train",
+  "val_path": "data\\extracted\\val",
+  "class_weights_used": [
+    0.0057342685759067535,
+    2.2880356311798096,
+    1.4109686613082886,
+    0.29526153206825256
+  ]
+}

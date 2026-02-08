@@ -1,0 +1,45 @@
+{
+  "project_name": "Brain_Tumor_Segmentation_Separate_Train_Val",
+  "author": "Your Name",
+  "institution": "Your University",
+  "data_dirs": {
+    "training": "data/raw/training",
+    "validation": "data/raw/validation",
+    "extracted": "data/extracted",
+    "processed": "data/processed_multi"
+  },
+  "image_size": 240,
+  "in_channels": 4,
+  "num_classes": 4,
+  "base_filters": 8,
+  "batch_size": 2,
+  "num_epochs": 15,
+  "learning_rate": 0.0005,
+  "patience": 10,
+  "augmentation": true,
+  "rotation_range": 15,
+  "scale_range": [
+    0.9,
+    1.1
+  ],
+  "flip_prob": 0.5,
+  "intensity_scale_range": [
+    0.8,
+    1.2
+  ],
+  "use_memory_mapping": true,
+  "max_cache_size": 2,
+  "clear_cache_every": 10,
+  "preload_patients": false,
+  "use_focal_loss": true,
+  "focal_gamma": 2.0,
+  "min_class_samples": 50,
+  "normalize_per_modality": true,
+  "clip_percentile": [
+    1,
+    99
+  ],
+  "extract_zip_files": true,
+  "use_existing_extracted": true,
+  "experiment_dir": "experiments_multi\\Brain_Tumor_Segmentation_Separate_Train_Val_20260208_100938"
+}

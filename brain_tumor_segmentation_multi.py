@@ -96,8 +96,8 @@ class MultiPatientConfig:
         self.image_size = 240
         self.in_channels = 4   # T1, T1ce, T2, FLAIR
         self.num_classes = 4   # Background + 3 tumor regions
-        self.base_filters = 8
-        
+        self.base_filters = 16
+
         # Training parameters - ADJUSTED FOR SMALL DATASET
         self.batch_size = 2
         self.num_epochs = 15           # Increased for more stable training
@@ -1256,6 +1256,7 @@ def train_separate_datasets():
             file_size = best_model_path.stat().st_size
             if file_size > 1024:
                 print(f"📦 Loading best model from checkpoint ({file_size/1024:.1f} KB)")
+                torch.serialization.add_safe_globals([np._core.multiarray.scalar])
                 best_checkpoint = torch.load(best_model_path, map_location=device)
                 
                 if 'model_state_dict' in best_checkpoint:
